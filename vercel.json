@@ -1,4 +1,10 @@
 {
+  "rewrites": [
+    {
+      "source": "/api/skio/:path*",
+      "destination": "/api/skio?path=:path*"
+    }
+  ],
   "headers": [
     {
       "source": "/api/(.*)",
