@@ -1,15 +1,4 @@
 {
-  "functions": {
-    "api/skio/[...path].js": {
-      "runtime": "nodejs20.x"
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/api/skio/:path*",
-      "destination": "/api/skio/:path*"
-    }
-  ],
   "headers": [
     {
       "source": "/api/(.*)",
