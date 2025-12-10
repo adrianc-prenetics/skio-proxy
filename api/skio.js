@@ -1,72 +1,181 @@
-// api/skio.js
-export default async function handler(req, res) {
-  // CORS - allow all im8 domains
-  const allowedOrigins = [
+// api/skio.js - Enterprise-grade Skio proxy with Redis caching & rate limiting
+import { kv } from '@vercel/kv';
+
+// ═══════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ═══════════════════════════════════════════════════════════════
+const CONFIG = {
+  CACHE_TTL_SECONDS: 300,          // 5 minutes cache for subscription status
+  RATE_LIMIT_WINDOW: 60,           // 1 minute window
+  RATE_LIMIT_MAX: 10,              // 10 requests per window per email
+  SKIO_GRAPHQL_URL: 'https://graphql.skio.com/v1/graphql',
+  ALLOWED_ORIGINS: [
     'https://im8health.com',
     'https://www.im8health.com',
     'https://im8store.myshopify.com',
-    'http://localhost:3000'
-  ];
+    'http://localhost:3000',
+    'http://127.0.0.1:9292'
+  ]
+};
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN HANDLER
+// ═══════════════════════════════════════════════════════════════
+export default async function handler(req, res) {
   
+  // ─────────────────────────────────────────────
+  // CORS
+  // ─────────────────────────────────────────────
   const origin = req.headers.origin;
-  
-  if (origin && allowedOrigins.includes(origin)) {
+  if (origin && CONFIG.ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
-  
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Max-Age', '86400');
-  
+
   // Handle preflight
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
 
-  // Official Skio GraphQL endpoint
-  const skioUrl = 'https://graphql.skio.com/v1/graphql';
+  // Only POST for GraphQL
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
-  // Verify API key exists
+  // ─────────────────────────────────────────────
+  // EXTRACT EMAIL
+  // ─────────────────────────────────────────────
+  const email = extractEmail(req.body);
+  if (!email) {
+    return res.status(400).json({
+      error: 'Bad request',
+      message: 'Email required in GraphQL variables'
+    });
+  }
+
+  const emailHash = hashString(email.toLowerCase());
+  const cacheKey = `skio:sub:${emailHash}`;
+  const rateLimitKey = `skio:rl:${emailHash}`;
+
+  // ─────────────────────────────────────────────
+  // RATE LIMITING
+  // ─────────────────────────────────────────────
+  try {
+    const count = await kv.incr(rateLimitKey);
+    
+    if (count === 1) {
+      await kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW);
+    }
+
+    res.setHeader('X-RateLimit-Limit', String(CONFIG.RATE_LIMIT_MAX));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, CONFIG.RATE_LIMIT_MAX - count)));
+
+    if (count > CONFIG.RATE_LIMIT_MAX) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        retryAfter: CONFIG.RATE_LIMIT_WINDOW
+      });
+    }
+  } catch (e) {
+    // KV error - continue without rate limiting
+    console.warn('Rate limit check failed:', e.message);
+  }
+
+  // ─────────────────────────────────────────────
+  // CHECK CACHE
+  // ─────────────────────────────────────────────
+  try {
+    const cached = await kv.get(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      res.setHeader('X-Cache-Age', String(Math.floor((Date.now() - (cached.cachedAt || 0)) / 1000)));
+      return res.status(200).json(cached);
+    }
+  } catch (e) {
+    console.warn('Cache check failed:', e.message);
+  }
+
+  res.setHeader('X-Cache', 'MISS');
+
+  // ─────────────────────────────────────────────
+  // CALL SKIO API
+  // ─────────────────────────────────────────────
   const apiKey = process.env.SKIO_API_KEY;
   if (!apiKey) {
-    console.error('SKIO_API_KEY environment variable not set');
-    return res.status(500).json({ 
-      error: 'Server configuration error',
-      message: 'SKIO_API_KEY not configured'
-    });
+    console.error('SKIO_API_KEY not configured');
+    return res.status(500).json({ error: 'Server configuration error' });
   }
 
   try {
-    const fetchOptions = {
-      method: 'POST', // GraphQL always uses POST
+    const skioResponse = await fetch(CONFIG.SKIO_GRAPHQL_URL, {
+      method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // CRITICAL: Skio expects lowercase "authorization" with "API " prefix
         'authorization': `API ${apiKey}`
+      },
+      body: JSON.stringify(req.body)
+    });
+
+    const data = await skioResponse.json();
+
+    // ─────────────────────────────────────────────
+    // CACHE SUCCESSFUL RESPONSE
+    // ─────────────────────────────────────────────
+    if (skioResponse.ok && !data.errors) {
+      const cacheData = {
+        ...data,
+        cached: true,
+        cachedAt: Date.now()
+      };
+
+      try {
+        await kv.set(cacheKey, cacheData, { ex: CONFIG.CACHE_TTL_SECONDS });
+      } catch (e) {
+        console.warn('Cache set failed:', e.message);
       }
-    };
-
-    if (req.body) {
-      fetchOptions.body = JSON.stringify(req.body);
     }
 
-    console.log('Proxying to Skio:', skioUrl);
-    
-    const response = await fetch(skioUrl, fetchOptions);
-    const data = await response.json();
-    
-    // Log for debugging (remove in production)
-    if (!response.ok) {
-      console.error('Skio API error:', response.status, data);
-    }
-    
-    res.status(response.status).json(data);
+    return res.status(skioResponse.status).json(data);
+
   } catch (error) {
-    console.error('Proxy error:', error);
-    res.status(500).json({ 
-      error: 'Proxy error', 
-      message: error.message 
+    console.error('Skio API error:', error.message);
+    return res.status(502).json({
+      error: 'Upstream error',
+      message: 'Failed to reach Skio API'
     });
   }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+function extractEmail(body) {
+  if (!body) return null;
+
+  // From variables
+  if (body.variables?.email) {
+    return body.variables.email;
+  }
+
+  // From inline query
+  if (typeof body.query === 'string') {
+    const match = body.query.match(/_eq:\s*"([^"]+@[^"]+)"/);
+    if (match) return match[1];
+  }
+
+  return null;
+}
+
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(36);
 }
