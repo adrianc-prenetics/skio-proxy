@@ -24,11 +24,13 @@ const CONFIG = {
 export default async function handler(req, res) {
   
   // ─────────────────────────────────────────────
-  // CORS
+  // CORS - Allow all origins for now (can restrict later)
   // ─────────────────────────────────────────────
   const origin = req.headers.origin;
-  if (origin && CONFIG.ALLOWED_ORIGINS.includes(origin)) {
+  if (origin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -61,7 +63,7 @@ export default async function handler(req, res) {
   const rateLimitKey = `skio:rl:${emailHash}`;
 
   // ─────────────────────────────────────────────
-  // RATE LIMITING
+  // RATE LIMITING (graceful - continues if KV fails)
   // ─────────────────────────────────────────────
   try {
     const count = await kv.incr(rateLimitKey);
@@ -80,8 +82,8 @@ export default async function handler(req, res) {
       });
     }
   } catch (e) {
-    // KV error - continue without rate limiting
     console.warn('Rate limit check failed:', e.message);
+    // Continue without rate limiting
   }
 
   // ─────────────────────────────────────────────
@@ -96,6 +98,7 @@ export default async function handler(req, res) {
     }
   } catch (e) {
     console.warn('Cache check failed:', e.message);
+    // Continue without cache
   }
 
   res.setHeader('X-Cache', 'MISS');

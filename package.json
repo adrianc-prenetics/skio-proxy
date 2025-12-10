@@ -5,5 +5,8 @@
   "description": "Vercel proxy for Skio API - keeps API key server-side",
   "scripts": {
     "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@vercel/kv": "^3.0.0"
   }
 }
