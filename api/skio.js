@@ -1,3 +1,4 @@
+// api/skio.js
 export default async function handler(req, res) {
   // CORS - allow all im8 domains
   const allowedOrigins = [
@@ -9,7 +10,6 @@ export default async function handler(req, res) {
   
   const origin = req.headers.origin;
   
-  // Check if origin matches any allowed origin
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
@@ -24,25 +24,42 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Get path from query parameter (set by Vercel rewrite)
-  const skioPath = req.query.path || '';
-  const skioUrl = `https://api.skio.com/${skioPath}`;
+  // Official Skio GraphQL endpoint
+  const skioUrl = 'https://graphql.skio.com/v1/graphql';
+
+  // Verify API key exists
+  const apiKey = process.env.SKIO_API_KEY;
+  if (!apiKey) {
+    console.error('SKIO_API_KEY environment variable not set');
+    return res.status(500).json({ 
+      error: 'Server configuration error',
+      message: 'SKIO_API_KEY not configured'
+    });
+  }
 
   try {
     const fetchOptions = {
-      method: req.method,
+      method: 'POST', // GraphQL always uses POST
       headers: {
         'Content-Type': 'application/json',
-        'X-Skio-API-Key': process.env.SKIO_API_KEY
+        // CRITICAL: Skio expects lowercase "authorization" with "API " prefix
+        'authorization': `API ${apiKey}`
       }
     };
 
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+    if (req.body) {
       fetchOptions.body = JSON.stringify(req.body);
     }
 
+    console.log('Proxying to Skio:', skioUrl);
+    
     const response = await fetch(skioUrl, fetchOptions);
     const data = await response.json();
+    
+    // Log for debugging (remove in production)
+    if (!response.ok) {
+      console.error('Skio API error:', response.status, data);
+    }
     
     res.status(response.status).json(data);
   } catch (error) {
