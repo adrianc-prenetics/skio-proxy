@@ -1,0 +1,9 @@
+{
+  "name": "skio-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Vercel proxy for Skio API - keeps API key server-side",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
