@@ -10,16 +10,16 @@ export default async function handler(req, res) {
   
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Build Skio URL from path segments
-  const path = req.query.path?.join('/') || '';
-  const skioUrl = `https://api.skio.com/${path}`;
+  // Get path from query parameter
+  const skioPath = req.query.path || '';
+  const skioUrl = `https://api.skio.com/${skioPath}`;
 
   try {
     const response = await fetch(skioUrl, {
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
-        'X-Skio-API-Key': process.env.SKIO_API_KEY  // Server-side only!
+        'X-Skio-API-Key': process.env.SKIO_API_KEY
       },
       body: req.method !== 'GET' ? JSON.stringify(req.body) : undefined
     });
@@ -27,6 +27,6 @@ export default async function handler(req, res) {
     const data = await response.json();
     res.status(response.status).json(data);
   } catch (error) {
-    res.status(500).json({ error: 'Proxy error' });
+    res.status(500).json({ error: 'Proxy error', details: error.message });
   }
 }
