@@ -393,7 +393,7 @@ async function verifyQuarterlySubscription(email) {
   }
 
   try {
-    // Email should already be lowercased by caller, but ensure it
+    // Normalize email for logging, but use _ilike for case-insensitive matching
     const emailLower = email.toLowerCase().trim();
     console.log('🔍 Verifying subscription for:', emailLower);
     
@@ -408,7 +408,7 @@ async function verifyQuarterlySubscription(email) {
           query CheckQuarterly($email: String!) {
             Subscriptions(
               where: {
-                StorefrontUser: { email: { _eq: $email } },
+                StorefrontUser: { email: { _ilike: $email } },
                 status: { _eq: "ACTIVE" }
               },
               limit: 10
