@@ -76,7 +76,9 @@ async function handleSkioQuery(req, res) {
     });
   }
 
-  const emailHash = hashString(email.toLowerCase());
+  // IMPORTANT: Normalize email to lowercase for consistent matching
+  const emailLower = email.toLowerCase().trim();
+  const emailHash = hashString(emailLower);
   const cacheKey = `skio:sub:${emailHash}`;
   const rateLimitKey = `skio:rl:${emailHash}`;
 
@@ -116,13 +118,20 @@ async function handleSkioQuery(req, res) {
   }
 
   try {
+    // IMPORTANT: Normalize email in the GraphQL query to match server-side verification
+    // This ensures client-side check and server-side verification use the same email format
+    const normalizedBody = { ...req.body };
+    if (normalizedBody.variables?.email) {
+      normalizedBody.variables = { ...normalizedBody.variables, email: emailLower };
+    }
+    
     const skioResponse = await fetch(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'authorization': `API ${apiKey}`
       },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(normalizedBody)
     });
 
     const data = await skioResponse.json();
@@ -384,7 +393,9 @@ async function verifyQuarterlySubscription(email) {
   }
 
   try {
-    console.log('🔍 Verifying subscription for:', email);
+    // Email should already be lowercased by caller, but ensure it
+    const emailLower = email.toLowerCase().trim();
+    console.log('🔍 Verifying subscription for:', emailLower);
     
     const response = await fetch(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
@@ -410,7 +421,7 @@ async function verifyQuarterlySubscription(email) {
             }
           }
         `,
-        variables: { email }
+        variables: { email: emailLower }
       })
     });
 
@@ -427,7 +438,13 @@ async function verifyQuarterlySubscription(email) {
     }
 
     const subscriptions = data.data?.Subscriptions || [];
-    console.log('📋 Found', subscriptions.length, 'active subscriptions');
+    console.log('📋 Found', subscriptions.length, 'active subscriptions for', emailLower);
+    
+    // Log all subscriptions for debugging
+    subscriptions.forEach((sub, i) => {
+      const policy = sub.BillingPolicy || {};
+      console.log(`  📦 Sub ${i + 1}: status=${sub.status}, interval=${policy.interval}, count=${policy.intervalCount}`);
+    });
     
     const hasQuarterly = subscriptions.some(sub => {
       const status = (sub.status || '').toUpperCase();
@@ -450,6 +467,10 @@ async function verifyQuarterlySubscription(email) {
       
       return isQuarterly;
     });
+
+    if (!hasQuarterly && subscriptions.length > 0) {
+      console.log('⚠️ User has subscriptions but none are quarterly');
+    }
 
     return hasQuarterly;
 
