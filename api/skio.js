@@ -33,9 +33,9 @@ const CONFIG = {
   KLAVIYO_REVISION: '2024-10-15',
   
   // Timeouts and retries - OPTIMIZED FOR UX
-  API_TIMEOUT_MS: 15000,               // 15 second timeout per attempt (balance UX vs reliability)
+  API_TIMEOUT_MS: 20000,               // 20 second timeout per attempt (increased for slow Skio responses)
   SKIO_RETRY_COUNT: 2,                 // 2 retries (3 attempts total)
-  SKIO_RETRY_DELAY_MS: 1000,           // 1 second between retries
+  SKIO_RETRY_DELAY_MS: 500,            // 0.5 second between retries (faster recovery)
   
   // Circuit breaker settings - MORE LENIENT
   CIRCUIT_BREAKER_THRESHOLD: 10,       // Open circuit after 10 consecutive failures
@@ -307,12 +307,21 @@ export default async function handler(req, res) {
   // HEALTH CHECK ENDPOINT
   // ─────────────────────────────────────────────
   if (req.method === 'GET') {
+    // Calculate max possible request duration for clients to use
+    // Formula: (timeout + delay) * attempts, with buffer
+    const maxRequestMs = (CONFIG.API_TIMEOUT_MS + CONFIG.SKIO_RETRY_DELAY_MS) * (CONFIG.SKIO_RETRY_COUNT + 1);
+    
     const health = {
       status: 'ok',
       timestamp: new Date().toISOString(),
       circuitBreaker: circuitBreaker.isOpen ? 'open' : 'closed',
       cacheAvailable: !!kv,
-      inFlightRequests: inFlightRequests.size
+      inFlightRequests: inFlightRequests.size,
+      // Expose timing config so clients can set appropriate timeouts
+      config: {
+        maxRequestMs,
+        recommendedClientTimeoutMs: maxRequestMs + 5000 // Add 5s buffer for network latency
+      }
     };
     return res.status(200).json(health);
   }
