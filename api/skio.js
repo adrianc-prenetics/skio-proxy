@@ -33,13 +33,13 @@ const CONFIG = {
   KLAVIYO_REVISION: '2024-10-15',
   
   // Timeouts and retries - OPTIMIZED FOR UX
-  API_TIMEOUT_MS: 8000,                // 8 second timeout per attempt (users won't wait longer)
-  SKIO_RETRY_COUNT: 1,                 // Only 1 retry (2 attempts total)
-  SKIO_RETRY_DELAY_MS: 500,            // 500ms between retries
+  API_TIMEOUT_MS: 15000,               // 15 second timeout per attempt (balance UX vs reliability)
+  SKIO_RETRY_COUNT: 2,                 // 2 retries (3 attempts total)
+  SKIO_RETRY_DELAY_MS: 1000,           // 1 second between retries
   
-  // Circuit breaker settings
-  CIRCUIT_BREAKER_THRESHOLD: 5,        // Open circuit after 5 consecutive failures
-  CIRCUIT_BREAKER_RESET_MS: 30000,     // Try again after 30 seconds
+  // Circuit breaker settings - MORE LENIENT
+  CIRCUIT_BREAKER_THRESHOLD: 10,       // Open circuit after 10 consecutive failures
+  CIRCUIT_BREAKER_RESET_MS: 15000,     // Try again after 15 seconds
   
   // Request deduplication window
   DEDUP_WINDOW_MS: 5000,               // Dedupe identical requests within 5 seconds
