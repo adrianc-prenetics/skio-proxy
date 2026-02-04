@@ -190,8 +190,8 @@ async function handleSkioQuery(req, res) {
       console.error('Skio API timeout after', CONFIG.API_TIMEOUT_MS, 'ms');
       return res.status(504).json({ error: 'Upstream timeout' });
     }
-    console.error('Skio API error:', error.message);
-    return res.status(502).json({ error: 'Upstream error' });
+    console.error('Skio API error:', error.name, error.message, error.stack);
+    return res.status(502).json({ error: 'Upstream error', details: error.message });
   }
 }
 
