@@ -157,6 +157,9 @@ async function handleSkioQuery(req, res) {
       normalizedBody.variables = { ...normalizedBody.variables, email: emailLower };
     }
     
+    console.log('🔄 Calling Skio API for:', emailLower);
+    const startTime = Date.now();
+    
     const skioResponse = await fetchWithTimeout(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
@@ -166,7 +169,14 @@ async function handleSkioQuery(req, res) {
       body: JSON.stringify(normalizedBody)
     });
 
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️ Skio API responded in ${elapsed}ms with status ${skioResponse.status}`);
+
     const data = await skioResponse.json();
+    
+    if (data.errors) {
+      console.error('❌ Skio GraphQL errors:', JSON.stringify(data.errors));
+    }
 
     if (skioResponse.ok && !data.errors) {
       // Fire-and-forget cache set (don't block response)
