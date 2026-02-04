@@ -11,6 +11,7 @@ const CONFIG = {
   SKIO_GRAPHQL_URL: 'https://graphql.skio.com/v1/graphql',
   KLAVIYO_API_URL: 'https://a.klaviyo.com/api',
   KLAVIYO_REVISION: '2024-10-15',
+  API_TIMEOUT_MS: 8000,            // 8 second timeout for external APIs
   ALLOWED_ORIGINS: [
     'https://im8health.com',
     'https://www.im8health.com',
@@ -19,6 +20,24 @@ const CONFIG = {
     'http://127.0.0.1:9292'
   ]
 };
+
+// ═══════════════════════════════════════════════════════════════
+// FETCH WITH TIMEOUT HELPER
+// ═══════════════════════════════════════════════════════════════
+async function fetchWithTimeout(url, options, timeoutMs = CONFIG.API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // MAIN HANDLER
@@ -82,30 +101,43 @@ async function handleSkioQuery(req, res) {
   const cacheKey = `skio:sub:${emailHash}`;
   const rateLimitKey = `skio:rl:${emailHash}`;
 
-  // Rate limiting
+  // ─────────────────────────────────────────────
+  // PARALLEL: Rate limiting + Cache check
+  // ─────────────────────────────────────────────
+  let rateLimitCount = 0;
+  let cached = null;
+  
   try {
-    const count = await kv.incr(rateLimitKey);
-    if (count === 1) {
-      await kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW);
-    }
-    res.setHeader('X-RateLimit-Limit', String(CONFIG.RATE_LIMIT_MAX));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, CONFIG.RATE_LIMIT_MAX - count)));
-    if (count > CONFIG.RATE_LIMIT_MAX) {
-      return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: CONFIG.RATE_LIMIT_WINDOW });
+    // Run rate limit increment and cache check in parallel
+    const [countResult, cachedResult] = await Promise.all([
+      kv.incr(rateLimitKey).catch(e => { console.warn('Rate limit incr failed:', e.message); return 0; }),
+      kv.get(cacheKey).catch(e => { console.warn('Cache get failed:', e.message); return null; })
+    ]);
+    
+    rateLimitCount = countResult || 0;
+    cached = cachedResult;
+    
+    // Set expiry if this is the first request (fire-and-forget, don't await)
+    if (rateLimitCount === 1) {
+      kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW).catch(() => {});
     }
   } catch (e) {
-    console.warn('Rate limit check failed:', e.message);
+    console.warn('Redis parallel operation failed:', e.message);
   }
 
-  // Check cache
-  try {
-    const cached = await kv.get(cacheKey);
-    if (cached) {
-      res.setHeader('X-Cache', 'HIT');
-      return res.status(200).json(cached);
-    }
-  } catch (e) {
-    console.warn('Cache check failed:', e.message);
+  // Set rate limit headers
+  res.setHeader('X-RateLimit-Limit', String(CONFIG.RATE_LIMIT_MAX));
+  res.setHeader('X-RateLimit-Remaining', String(Math.max(0, CONFIG.RATE_LIMIT_MAX - rateLimitCount)));
+  
+  // Check rate limit
+  if (rateLimitCount > CONFIG.RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: CONFIG.RATE_LIMIT_WINDOW });
+  }
+
+  // Return cached response if available
+  if (cached) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.status(200).json(cached);
   }
 
   res.setHeader('X-Cache', 'MISS');
@@ -125,7 +157,7 @@ async function handleSkioQuery(req, res) {
       normalizedBody.variables = { ...normalizedBody.variables, email: emailLower };
     }
     
-    const skioResponse = await fetch(CONFIG.SKIO_GRAPHQL_URL, {
+    const skioResponse = await fetchWithTimeout(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -137,15 +169,17 @@ async function handleSkioQuery(req, res) {
     const data = await skioResponse.json();
 
     if (skioResponse.ok && !data.errors) {
-      try {
-        await kv.set(cacheKey, { ...data, cached: true, cachedAt: Date.now() }, { ex: CONFIG.CACHE_TTL_SECONDS });
-      } catch (e) {
-        console.warn('Cache set failed:', e.message);
-      }
+      // Fire-and-forget cache set (don't block response)
+      kv.set(cacheKey, { ...data, cached: true, cachedAt: Date.now() }, { ex: CONFIG.CACHE_TTL_SECONDS })
+        .catch(e => console.warn('Cache set failed:', e.message));
     }
 
     return res.status(skioResponse.status).json(data);
   } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error('Skio API timeout after', CONFIG.API_TIMEOUT_MS, 'ms');
+      return res.status(504).json({ error: 'Upstream timeout' });
+    }
     console.error('Skio API error:', error.message);
     return res.status(502).json({ error: 'Upstream error' });
   }
@@ -170,8 +204,9 @@ async function handleClassReservation(req, res) {
   const rateLimitKey = `reserve:rl:${emailHash}`;
   try {
     const count = await kv.incr(rateLimitKey);
+    // Fire-and-forget expire (don't await)
     if (count === 1) {
-      await kv.expire(rateLimitKey, 300); // 5 minute window
+      kv.expire(rateLimitKey, 300).catch(() => {}); // 5 minute window
     }
     if (count > 5) { // Only 5 reservation attempts per 5 minutes
       return res.status(429).json({ 
@@ -210,9 +245,19 @@ async function handleClassReservation(req, res) {
 
   const timestamp = new Date().toISOString();
   const klaviyoListId = process.env.KLAVIYO_90DAY_LIST_ID || 'Xnm4ac';
+  
+  // Shared Klaviyo headers
+  const klaviyoHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Authorization': `Klaviyo-API-Key ${klaviyoApiKey}`,
+    'revision': CONFIG.KLAVIYO_REVISION
+  };
 
   try {
-    // 1. Create/Update Profile
+    // ─────────────────────────────────────────────
+    // STEP 1: Create/Update Profile (must complete first)
+    // ─────────────────────────────────────────────
     const profilePayload = {
       data: {
         type: 'profile',
@@ -247,33 +292,26 @@ async function handleClassReservation(req, res) {
 
     console.log('📤 Creating/updating Klaviyo profile...');
     
-    const profileResponse = await fetch(`${CONFIG.KLAVIYO_API_URL}/profiles/`, {
+    const profileResponse = await fetchWithTimeout(`${CONFIG.KLAVIYO_API_URL}/profiles/`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Klaviyo-API-Key ${klaviyoApiKey}`,
-        'revision': CONFIG.KLAVIYO_REVISION
-      },
+      headers: klaviyoHeaders,
       body: JSON.stringify(profilePayload)
     });
 
-    let profileId = null;
-    
     if (profileResponse.ok) {
       const profileData = await profileResponse.json();
-      profileId = profileData.data?.id;
-      console.log('✅ Profile created, ID:', profileId);
+      console.log('✅ Profile created, ID:', profileData.data?.id);
     } else if (profileResponse.status === 409) {
-      // Profile exists, that's fine
       console.log('ℹ️ Profile already exists');
     } else {
       const errorText = await profileResponse.text();
       console.error('⚠️ Profile creation warning:', profileResponse.status, errorText);
     }
 
-    // 2. Subscribe to List
-    console.log('📤 Adding to 90-Day list...');
+    // ─────────────────────────────────────────────
+    // STEP 2 & 3: Subscribe to List + Track Event (PARALLEL)
+    // ─────────────────────────────────────────────
+    console.log('📤 Adding to list + tracking event in parallel...');
     
     const subscribePayload = {
       data: {
@@ -299,26 +337,6 @@ async function handleClassReservation(req, res) {
       }
     };
 
-    const subscribeResponse = await fetch(`${CONFIG.KLAVIYO_API_URL}/profile-subscription-bulk-create-jobs/`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Klaviyo-API-Key ${klaviyoApiKey}`,
-        'revision': CONFIG.KLAVIYO_REVISION
-      },
-      body: JSON.stringify(subscribePayload)
-    });
-
-    if (subscribeResponse.ok || subscribeResponse.status === 202) {
-      console.log('✅ Added to list');
-    } else {
-      console.warn('⚠️ List subscription warning:', subscribeResponse.status);
-    }
-
-    // 3. Track Event
-    console.log('📤 Tracking reservation event...');
-    
     const eventPayload = {
       data: {
         type: 'event',
@@ -350,21 +368,32 @@ async function handleClassReservation(req, res) {
       }
     };
 
-    const eventResponse = await fetch(`${CONFIG.KLAVIYO_API_URL}/events/`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Klaviyo-API-Key ${klaviyoApiKey}`,
-        'revision': CONFIG.KLAVIYO_REVISION
-      },
-      body: JSON.stringify(eventPayload)
-    });
+    // Run subscribe and event tracking in parallel
+    const [subscribeResponse, eventResponse] = await Promise.all([
+      fetchWithTimeout(`${CONFIG.KLAVIYO_API_URL}/profile-subscription-bulk-create-jobs/`, {
+        method: 'POST',
+        headers: klaviyoHeaders,
+        body: JSON.stringify(subscribePayload)
+      }).catch(e => ({ ok: false, error: e.message })),
+      
+      fetchWithTimeout(`${CONFIG.KLAVIYO_API_URL}/events/`, {
+        method: 'POST',
+        headers: klaviyoHeaders,
+        body: JSON.stringify(eventPayload)
+      }).catch(e => ({ ok: false, error: e.message }))
+    ]);
+
+    // Log results (non-blocking)
+    if (subscribeResponse.ok || subscribeResponse.status === 202) {
+      console.log('✅ Added to list');
+    } else {
+      console.warn('⚠️ List subscription warning:', subscribeResponse.status || subscribeResponse.error);
+    }
 
     if (eventResponse.ok || eventResponse.status === 202) {
       console.log('✅ Event tracked');
     } else {
-      console.warn('⚠️ Event tracking warning:', eventResponse.status);
+      console.warn('⚠️ Event tracking warning:', eventResponse.status || eventResponse.error);
     }
 
     console.log('🎉 Class reservation complete for:', emailLower);
@@ -377,6 +406,10 @@ async function handleClassReservation(req, res) {
     });
 
   } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error('❌ Klaviyo API timeout');
+      return res.status(504).json({ error: 'Upstream timeout during reservation' });
+    }
     console.error('❌ Klaviyo submission error:', error.message);
     return res.status(500).json({ error: 'Failed to complete reservation' });
   }
@@ -397,7 +430,7 @@ async function verifyQuarterlySubscription(email) {
     const emailLower = email.toLowerCase().trim();
     console.log('🔍 Verifying subscription for:', emailLower);
     
-    const response = await fetch(CONFIG.SKIO_GRAPHQL_URL, {
+    const response = await fetchWithTimeout(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -475,7 +508,11 @@ async function verifyQuarterlySubscription(email) {
     return hasQuarterly;
 
   } catch (error) {
-    console.error('❌ Subscription verification error:', error.message);
+    if (error.name === 'AbortError') {
+      console.error('❌ Subscription verification timeout after', CONFIG.API_TIMEOUT_MS, 'ms');
+    } else {
+      console.error('❌ Subscription verification error:', error.message);
+    }
     return false;
   }
 }
