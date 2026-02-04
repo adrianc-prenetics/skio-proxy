@@ -1,6 +1,9 @@
 // api/skio.js - Enterprise-grade Skio + Klaviyo proxy with Redis caching & rate limiting
+// Updated: 2026 - Bulletproof gateway with stale-while-revalidate, circuit breaker, and request deduplication
 
-// KV is optional - works without it but with no caching/rate limiting
+// ═══════════════════════════════════════════════════════════════
+// REDIS/KV INITIALIZATION (Upstash Redis via Vercel Marketplace)
+// ═══════════════════════════════════════════════════════════════
 let kv = null;
 try {
   if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
@@ -15,13 +18,33 @@ try {
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════
 const CONFIG = {
-  CACHE_TTL_SECONDS: 300,          // 5 minutes cache for subscription status
-  RATE_LIMIT_WINDOW: 60,           // 1 minute window
-  RATE_LIMIT_MAX: 10,              // 10 requests per window per email
+  // Cache settings
+  CACHE_TTL_SECONDS: 300,              // 5 minutes fresh cache
+  STALE_TTL_SECONDS: 3600,             // 1 hour stale cache (serve while revalidating)
+  NEGATIVE_CACHE_TTL: 60,              // 1 minute cache for non-subscribers (shorter to catch new subs)
+  
+  // Rate limiting
+  RATE_LIMIT_WINDOW: 60,               // 1 minute window
+  RATE_LIMIT_MAX: 10,                  // 10 requests per window per email
+  
+  // External APIs
   SKIO_GRAPHQL_URL: 'https://graphql.skio.com/v1/graphql',
   KLAVIYO_API_URL: 'https://a.klaviyo.com/api',
   KLAVIYO_REVISION: '2024-10-15',
-  API_TIMEOUT_MS: 25000,           // 25 second timeout for external APIs (Skio can be slow)
+  
+  // Timeouts and retries - OPTIMIZED FOR UX
+  API_TIMEOUT_MS: 8000,                // 8 second timeout per attempt (users won't wait longer)
+  SKIO_RETRY_COUNT: 1,                 // Only 1 retry (2 attempts total)
+  SKIO_RETRY_DELAY_MS: 500,            // 500ms between retries
+  
+  // Circuit breaker settings
+  CIRCUIT_BREAKER_THRESHOLD: 5,        // Open circuit after 5 consecutive failures
+  CIRCUIT_BREAKER_RESET_MS: 30000,     // Try again after 30 seconds
+  
+  // Request deduplication window
+  DEDUP_WINDOW_MS: 5000,               // Dedupe identical requests within 5 seconds
+  
+  // CORS
   ALLOWED_ORIGINS: [
     'https://im8health.com',
     'https://www.im8health.com',
@@ -30,6 +53,53 @@ const CONFIG = {
     'http://127.0.0.1:9292'
   ]
 };
+
+// ═══════════════════════════════════════════════════════════════
+// IN-MEMORY STATE (per-instance, resets on cold start)
+// ═══════════════════════════════════════════════════════════════
+const circuitBreaker = {
+  failures: 0,
+  lastFailure: 0,
+  isOpen: false
+};
+
+// In-flight request deduplication map
+const inFlightRequests = new Map();
+
+// ═══════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER
+// ═══════════════════════════════════════════════════════════════
+function checkCircuitBreaker() {
+  if (!circuitBreaker.isOpen) return true;
+  
+  // Check if enough time has passed to try again
+  const timeSinceFailure = Date.now() - circuitBreaker.lastFailure;
+  if (timeSinceFailure >= CONFIG.CIRCUIT_BREAKER_RESET_MS) {
+    console.log('🔌 Circuit breaker: Half-open, allowing test request');
+    return true; // Allow a test request
+  }
+  
+  console.log('🔌 Circuit breaker: OPEN, rejecting request');
+  return false;
+}
+
+function recordSuccess() {
+  if (circuitBreaker.failures > 0 || circuitBreaker.isOpen) {
+    console.log('🔌 Circuit breaker: Reset after success');
+  }
+  circuitBreaker.failures = 0;
+  circuitBreaker.isOpen = false;
+}
+
+function recordFailure() {
+  circuitBreaker.failures++;
+  circuitBreaker.lastFailure = Date.now();
+  
+  if (circuitBreaker.failures >= CONFIG.CIRCUIT_BREAKER_THRESHOLD) {
+    circuitBreaker.isOpen = true;
+    console.log(`🔌 Circuit breaker: OPENED after ${circuitBreaker.failures} failures`);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // FETCH WITH TIMEOUT HELPER
@@ -50,9 +120,166 @@ async function fetchWithTimeout(url, options, timeoutMs = CONFIG.API_TIMEOUT_MS)
 }
 
 // ═══════════════════════════════════════════════════════════════
+// FETCH WITH RETRY + CIRCUIT BREAKER
+// ═══════════════════════════════════════════════════════════════
+async function fetchWithRetry(url, options, { 
+  maxRetries = CONFIG.SKIO_RETRY_COUNT, 
+  retryDelayMs = CONFIG.SKIO_RETRY_DELAY_MS,
+  timeoutMs = CONFIG.API_TIMEOUT_MS 
+} = {}) {
+  // Check circuit breaker first
+  if (!checkCircuitBreaker()) {
+    throw new Error('Circuit breaker is open - Skio API temporarily unavailable');
+  }
+  
+  let lastError;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        console.log(`🔄 Retry attempt ${attempt}/${maxRetries} after ${retryDelayMs}ms...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        // Exponential backoff: double the delay for next retry
+        retryDelayMs *= 2;
+      }
+      
+      const response = await fetchWithTimeout(url, options, timeoutMs);
+      
+      // Retry on 5xx errors (server issues) but not 4xx (client errors)
+      if (response.status >= 500 && attempt < maxRetries) {
+        console.log(`⚠️ Skio returned ${response.status}, will retry...`);
+        lastError = new Error(`HTTP ${response.status}`);
+        continue;
+      }
+      
+      // Success! Record it for circuit breaker
+      if (response.ok) {
+        recordSuccess();
+      }
+      
+      return response;
+    } catch (error) {
+      lastError = error;
+      
+      // Don't retry on abort (timeout) if we've exhausted retries
+      if (error.name === 'AbortError') {
+        console.log(`⏱️ Request timed out (attempt ${attempt + 1}/${maxRetries + 1})`);
+        if (attempt >= maxRetries) {
+          recordFailure();
+          throw error;
+        }
+        continue;
+      }
+      
+      // Network errors - retry
+      if (attempt < maxRetries) {
+        console.log(`⚠️ Network error: ${error.message}, will retry...`);
+        continue;
+      }
+      
+      recordFailure();
+      throw error;
+    }
+  }
+  
+  recordFailure();
+  throw lastError;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REQUEST DEDUPLICATION
+// Prevents multiple identical requests from hitting Skio simultaneously
+// ═══════════════════════════════════════════════════════════════
+function getOrCreateInflightRequest(key, requestFn) {
+  // Check if there's already an in-flight request for this key
+  const existing = inFlightRequests.get(key);
+  if (existing && (Date.now() - existing.timestamp) < CONFIG.DEDUP_WINDOW_MS) {
+    console.log(`🔗 Deduplicating request for ${key}`);
+    return existing.promise;
+  }
+  
+  // Create new request
+  const promise = requestFn().finally(() => {
+    // Clean up after request completes (with small delay to catch rapid duplicates)
+    setTimeout(() => {
+      const current = inFlightRequests.get(key);
+      if (current && current.promise === promise) {
+        inFlightRequests.delete(key);
+      }
+    }, 100);
+  });
+  
+  inFlightRequests.set(key, { promise, timestamp: Date.now() });
+  return promise;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// STALE-WHILE-REVALIDATE CACHE
+// Returns stale data immediately while refreshing in background
+// ═══════════════════════════════════════════════════════════════
+async function getWithSWR(cacheKey, fetchFn, options = {}) {
+  const {
+    freshTTL = CONFIG.CACHE_TTL_SECONDS,
+    staleTTL = CONFIG.STALE_TTL_SECONDS
+  } = options;
+  
+  if (!kv) {
+    // No cache available, just fetch
+    return { data: await fetchFn(), cacheStatus: 'BYPASS' };
+  }
+  
+  try {
+    const cached = await kv.get(cacheKey);
+    
+    if (cached) {
+      const age = (Date.now() - (cached.cachedAt || 0)) / 1000;
+      
+      if (age < freshTTL) {
+        // Fresh cache - return immediately
+        return { data: cached, cacheStatus: 'HIT' };
+      }
+      
+      if (age < staleTTL) {
+        // Stale cache - return immediately but revalidate in background
+        console.log(`📦 Serving stale cache (${Math.round(age)}s old), revalidating...`);
+        
+        // Fire-and-forget background revalidation
+        fetchFn()
+          .then(freshData => {
+            if (freshData) {
+              kv.set(cacheKey, { ...freshData, cached: true, cachedAt: Date.now() }, { ex: staleTTL })
+                .catch(e => console.warn('Background cache update failed:', e.message));
+            }
+          })
+          .catch(e => console.warn('Background revalidation failed:', e.message));
+        
+        return { data: cached, cacheStatus: 'STALE' };
+      }
+    }
+    
+    // No cache or expired - fetch fresh
+    const freshData = await fetchFn();
+    
+    // Cache the result (fire-and-forget)
+    if (freshData) {
+      kv.set(cacheKey, { ...freshData, cached: true, cachedAt: Date.now() }, { ex: staleTTL })
+        .catch(e => console.warn('Cache set failed:', e.message));
+    }
+    
+    return { data: freshData, cacheStatus: 'MISS' };
+    
+  } catch (cacheError) {
+    console.warn('Cache operation failed:', cacheError.message);
+    // Fallback to direct fetch
+    return { data: await fetchFn(), cacheStatus: 'ERROR' };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════
 export default async function handler(req, res) {
+  const startTime = Date.now();
   
   // ─────────────────────────────────────────────
   // CORS
@@ -66,7 +293,7 @@ export default async function handler(req, res) {
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -74,6 +301,20 @@ export default async function handler(req, res) {
   // Handle preflight
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
+  }
+  
+  // ─────────────────────────────────────────────
+  // HEALTH CHECK ENDPOINT
+  // ─────────────────────────────────────────────
+  if (req.method === 'GET') {
+    const health = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      circuitBreaker: circuitBreaker.isOpen ? 'open' : 'closed',
+      cacheAvailable: !!kv,
+      inFlightRequests: inFlightRequests.size
+    };
+    return res.status(200).json(health);
   }
 
   if (req.method !== 'POST') {
@@ -85,12 +326,24 @@ export default async function handler(req, res) {
   // ─────────────────────────────────────────────
   const action = req.body?.action;
   
-  if (action === 'reserve-class') {
-    return handleClassReservation(req, res);
+  try {
+    let result;
+    
+    if (action === 'reserve-class') {
+      result = await handleClassReservation(req, res);
+    } else {
+      result = await handleSkioQuery(req, res);
+    }
+    
+    // Add timing header
+    res.setHeader('X-Response-Time', `${Date.now() - startTime}ms`);
+    return result;
+    
+  } catch (error) {
+    console.error('Unhandled error:', error);
+    res.setHeader('X-Response-Time', `${Date.now() - startTime}ms`);
+    return res.status(500).json({ error: 'Internal server error' });
   }
-  
-  // Default: Skio subscription check (existing behavior)
-  return handleSkioQuery(req, res);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -110,30 +363,21 @@ async function handleSkioQuery(req, res) {
   const emailHash = hashString(emailLower);
   const cacheKey = `skio:sub:${emailHash}`;
   const rateLimitKey = `skio:rl:${emailHash}`;
+  const dedupKey = `skio:${emailHash}`;
 
   // ─────────────────────────────────────────────
-  // PARALLEL: Rate limiting + Cache check (if KV available)
+  // RATE LIMITING (if KV available)
   // ─────────────────────────────────────────────
   let rateLimitCount = 0;
-  let cached = null;
   
   if (kv) {
     try {
-      // Run rate limit increment and cache check in parallel
-      const [countResult, cachedResult] = await Promise.all([
-        kv.incr(rateLimitKey).catch(e => { console.warn('Rate limit incr failed:', e.message); return 0; }),
-        kv.get(cacheKey).catch(e => { console.warn('Cache get failed:', e.message); return null; })
-      ]);
-      
-      rateLimitCount = countResult || 0;
-      cached = cachedResult;
-      
-      // Set expiry if this is the first request (fire-and-forget, don't await)
+      rateLimitCount = await kv.incr(rateLimitKey).catch(() => 0);
       if (rateLimitCount === 1) {
         kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW).catch(() => {});
       }
     } catch (e) {
-      console.warn('Redis parallel operation failed:', e.message);
+      console.warn('Rate limit check failed:', e.message);
     }
   }
 
@@ -146,33 +390,44 @@ async function handleSkioQuery(req, res) {
     return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: CONFIG.RATE_LIMIT_WINDOW });
   }
 
-  // Return cached response if available
-  if (cached) {
-    res.setHeader('X-Cache', 'HIT');
-    return res.status(200).json(cached);
+  // ─────────────────────────────────────────────
+  // CHECK CIRCUIT BREAKER - Return stale cache if open
+  // ─────────────────────────────────────────────
+  if (circuitBreaker.isOpen && kv) {
+    try {
+      const staleCache = await kv.get(cacheKey);
+      if (staleCache) {
+        console.log('🔌 Circuit breaker open - serving stale cache');
+        res.setHeader('X-Cache', 'STALE-CIRCUIT-OPEN');
+        res.setHeader('X-Circuit-Breaker', 'open');
+        return res.status(200).json(staleCache);
+      }
+    } catch (e) {
+      console.warn('Stale cache fetch failed:', e.message);
+    }
   }
 
-  res.setHeader('X-Cache', 'MISS');
-
-  // Call Skio API
+  // ─────────────────────────────────────────────
+  // FETCH WITH SWR + DEDUPLICATION
+  // ─────────────────────────────────────────────
   const apiKey = process.env.SKIO_API_KEY;
   if (!apiKey) {
     console.error('SKIO_API_KEY not configured');
     return res.status(500).json({ error: 'Server configuration error' });
   }
 
-  try {
-    // IMPORTANT: Normalize email in the GraphQL query to match server-side verification
-    // This ensures client-side check and server-side verification use the same email format
-    const normalizedBody = { ...req.body };
-    if (normalizedBody.variables?.email) {
-      normalizedBody.variables = { ...normalizedBody.variables, email: emailLower };
-    }
-    
+  // Normalize the request body
+  const normalizedBody = { ...req.body };
+  if (normalizedBody.variables?.email) {
+    normalizedBody.variables = { ...normalizedBody.variables, email: emailLower };
+  }
+
+  // Create the fetch function
+  const fetchSkio = async () => {
     console.log('🔄 Calling Skio API for:', emailLower);
     const startTime = Date.now();
     
-    const skioResponse = await fetchWithTimeout(CONFIG.SKIO_GRAPHQL_URL, {
+    const skioResponse = await fetchWithRetry(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -189,19 +444,55 @@ async function handleSkioQuery(req, res) {
     if (data.errors) {
       console.error('❌ Skio GraphQL errors:', JSON.stringify(data.errors));
     }
+    
+    return data;
+  };
 
-    if (skioResponse.ok && !data.errors && kv) {
-      // Fire-and-forget cache set (don't block response)
-      kv.set(cacheKey, { ...data, cached: true, cachedAt: Date.now() }, { ex: CONFIG.CACHE_TTL_SECONDS })
-        .catch(e => console.warn('Cache set failed:', e.message));
-    }
+  try {
+    // Use request deduplication to prevent thundering herd
+    const { data, cacheStatus } = await getOrCreateInflightRequest(dedupKey, async () => {
+      return getWithSWR(cacheKey, fetchSkio);
+    });
 
-    return res.status(skioResponse.status).json(data);
+    res.setHeader('X-Cache', cacheStatus);
+    res.setHeader('X-Circuit-Breaker', circuitBreaker.isOpen ? 'open' : 'closed');
+    
+    return res.status(200).json(data);
+    
   } catch (error) {
+    // ─────────────────────────────────────────────
+    // GRACEFUL DEGRADATION - Try stale cache on error
+    // ─────────────────────────────────────────────
+    if (kv) {
+      try {
+        const staleCache = await kv.get(cacheKey);
+        if (staleCache) {
+          console.log('⚠️ Skio API failed, serving stale cache');
+          res.setHeader('X-Cache', 'STALE-ERROR');
+          res.setHeader('X-Circuit-Breaker', circuitBreaker.isOpen ? 'open' : 'closed');
+          return res.status(200).json(staleCache);
+        }
+      } catch (e) {
+        console.warn('Stale cache fetch failed:', e.message);
+      }
+    }
+    
     if (error.name === 'AbortError') {
       console.error('Skio API timeout after', CONFIG.API_TIMEOUT_MS, 'ms');
-      return res.status(504).json({ error: 'Upstream timeout' });
+      return res.status(504).json({ 
+        error: 'Upstream timeout',
+        message: 'The subscription service is temporarily slow. Please try again.'
+      });
     }
+    
+    if (error.message?.includes('Circuit breaker')) {
+      return res.status(503).json({
+        error: 'Service temporarily unavailable',
+        message: 'The subscription service is temporarily unavailable. Please try again shortly.',
+        retryAfter: Math.ceil(CONFIG.CIRCUIT_BREAKER_RESET_MS / 1000)
+      });
+    }
+    
     console.error('Skio API error:', error.name, error.message, error.stack);
     return res.status(502).json({ error: 'Upstream error', details: error.message });
   }
@@ -449,12 +740,27 @@ async function verifyQuarterlySubscription(email) {
     return false;
   }
 
+  const emailLower = email.toLowerCase().trim();
+  const emailHash = hashString(emailLower);
+  const cacheKey = `skio:verify:${emailHash}`;
+
+  // Check cache first (for reservations, we want fresh data but can use short cache)
+  if (kv) {
+    try {
+      const cached = await kv.get(cacheKey);
+      if (cached && (Date.now() - cached.cachedAt) < 60000) { // 1 minute cache for verification
+        console.log('📦 Using cached verification result');
+        return cached.hasQuarterly;
+      }
+    } catch (e) {
+      console.warn('Verification cache check failed:', e.message);
+    }
+  }
+
   try {
-    // Normalize email for logging, but use _ilike for case-insensitive matching
-    const emailLower = email.toLowerCase().trim();
     console.log('🔍 Verifying subscription for:', emailLower);
     
-    const response = await fetchWithTimeout(CONFIG.SKIO_GRAPHQL_URL, {
+    const response = await fetchWithRetry(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -527,6 +833,12 @@ async function verifyQuarterlySubscription(email) {
 
     if (!hasQuarterly && subscriptions.length > 0) {
       console.log('⚠️ User has subscriptions but none are quarterly');
+    }
+
+    // Cache the result
+    if (kv) {
+      kv.set(cacheKey, { hasQuarterly, cachedAt: Date.now() }, { ex: 60 })
+        .catch(e => console.warn('Verification cache set failed:', e.message));
     }
 
     return hasQuarterly;
