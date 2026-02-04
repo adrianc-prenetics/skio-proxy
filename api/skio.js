@@ -1,5 +1,15 @@
 // api/skio.js - Enterprise-grade Skio + Klaviyo proxy with Redis caching & rate limiting
-import { kv } from '@vercel/kv';
+
+// KV is optional - works without it but with no caching/rate limiting
+let kv = null;
+try {
+  if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
+    const kvModule = await import('@vercel/kv');
+    kv = kvModule.kv;
+  }
+} catch (e) {
+  console.warn('KV not available:', e.message);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -102,27 +112,29 @@ async function handleSkioQuery(req, res) {
   const rateLimitKey = `skio:rl:${emailHash}`;
 
   // ─────────────────────────────────────────────
-  // PARALLEL: Rate limiting + Cache check
+  // PARALLEL: Rate limiting + Cache check (if KV available)
   // ─────────────────────────────────────────────
   let rateLimitCount = 0;
   let cached = null;
   
-  try {
-    // Run rate limit increment and cache check in parallel
-    const [countResult, cachedResult] = await Promise.all([
-      kv.incr(rateLimitKey).catch(e => { console.warn('Rate limit incr failed:', e.message); return 0; }),
-      kv.get(cacheKey).catch(e => { console.warn('Cache get failed:', e.message); return null; })
-    ]);
-    
-    rateLimitCount = countResult || 0;
-    cached = cachedResult;
-    
-    // Set expiry if this is the first request (fire-and-forget, don't await)
-    if (rateLimitCount === 1) {
-      kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW).catch(() => {});
+  if (kv) {
+    try {
+      // Run rate limit increment and cache check in parallel
+      const [countResult, cachedResult] = await Promise.all([
+        kv.incr(rateLimitKey).catch(e => { console.warn('Rate limit incr failed:', e.message); return 0; }),
+        kv.get(cacheKey).catch(e => { console.warn('Cache get failed:', e.message); return null; })
+      ]);
+      
+      rateLimitCount = countResult || 0;
+      cached = cachedResult;
+      
+      // Set expiry if this is the first request (fire-and-forget, don't await)
+      if (rateLimitCount === 1) {
+        kv.expire(rateLimitKey, CONFIG.RATE_LIMIT_WINDOW).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('Redis parallel operation failed:', e.message);
     }
-  } catch (e) {
-    console.warn('Redis parallel operation failed:', e.message);
   }
 
   // Set rate limit headers
@@ -178,7 +190,7 @@ async function handleSkioQuery(req, res) {
       console.error('❌ Skio GraphQL errors:', JSON.stringify(data.errors));
     }
 
-    if (skioResponse.ok && !data.errors) {
+    if (skioResponse.ok && !data.errors && kv) {
       // Fire-and-forget cache set (don't block response)
       kv.set(cacheKey, { ...data, cached: true, cachedAt: Date.now() }, { ex: CONFIG.CACHE_TTL_SECONDS })
         .catch(e => console.warn('Cache set failed:', e.message));
@@ -209,23 +221,25 @@ async function handleClassReservation(req, res) {
   const emailHash = hashString(emailLower);
 
   // ─────────────────────────────────────────────
-  // RATE LIMIT (stricter for reservations)
+  // RATE LIMIT (stricter for reservations) - if KV available
   // ─────────────────────────────────────────────
-  const rateLimitKey = `reserve:rl:${emailHash}`;
-  try {
-    const count = await kv.incr(rateLimitKey);
-    // Fire-and-forget expire (don't await)
-    if (count === 1) {
-      kv.expire(rateLimitKey, 300).catch(() => {}); // 5 minute window
+  if (kv) {
+    const rateLimitKey = `reserve:rl:${emailHash}`;
+    try {
+      const count = await kv.incr(rateLimitKey);
+      // Fire-and-forget expire (don't await)
+      if (count === 1) {
+        kv.expire(rateLimitKey, 300).catch(() => {}); // 5 minute window
+      }
+      if (count > 5) { // Only 5 reservation attempts per 5 minutes
+        return res.status(429).json({ 
+          error: 'Too many reservation attempts',
+          message: 'Please wait a few minutes before trying again'
+        });
+      }
+    } catch (e) {
+      console.warn('Rate limit check failed:', e.message);
     }
-    if (count > 5) { // Only 5 reservation attempts per 5 minutes
-      return res.status(429).json({ 
-        error: 'Too many reservation attempts',
-        message: 'Please wait a few minutes before trying again'
-      });
-    }
-  } catch (e) {
-    console.warn('Rate limit check failed:', e.message);
   }
 
   // ─────────────────────────────────────────────
