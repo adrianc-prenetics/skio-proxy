@@ -11,7 +11,7 @@ const CONFIG = {
   SKIO_GRAPHQL_URL: 'https://graphql.skio.com/v1/graphql',
   KLAVIYO_API_URL: 'https://a.klaviyo.com/api',
   KLAVIYO_REVISION: '2024-10-15',
-  API_TIMEOUT_MS: 8000,            // 8 second timeout for external APIs
+  API_TIMEOUT_MS: 25000,           // 25 second timeout for external APIs (Skio can be slow)
   ALLOWED_ORIGINS: [
     'https://im8health.com',
     'https://www.im8health.com',
