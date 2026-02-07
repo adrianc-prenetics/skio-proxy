@@ -769,6 +769,7 @@ async function verifyQuarterlySubscription(email) {
   try {
     console.log('🔍 Verifying subscription for:', emailLower);
     
+    // Use emailLower with _eq for fast indexed lookup (instead of slow _ilike)
     const response = await fetchWithRetry(CONFIG.SKIO_GRAPHQL_URL, {
       method: 'POST',
       headers: {
@@ -780,7 +781,7 @@ async function verifyQuarterlySubscription(email) {
           query CheckQuarterly($email: String!) {
             Subscriptions(
               where: {
-                StorefrontUser: { email: { _ilike: $email } },
+                StorefrontUser: { emailLower: { _eq: $email } },
                 status: { _eq: "ACTIVE" }
               },
               limit: 10
