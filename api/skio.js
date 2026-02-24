@@ -51,7 +51,10 @@ const CONFIG = {
     'https://im8official.myshopify.com',
     'http://localhost:3000',
     'http://127.0.0.1:9292'
-  ]
+  ],
+
+  // Manual exception rules
+  EXCEPTION_RULES_KEY: 'skio:exceptions:rules'
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -65,6 +68,51 @@ const circuitBreaker = {
 
 // In-flight request deduplication map
 const inFlightRequests = new Map();
+
+function normalizeEmail(email) {
+  return (email || '').toLowerCase().trim();
+}
+
+async function getExceptionRules() {
+  if (!kv) return {};
+  try {
+    const rules = await kv.get(CONFIG.EXCEPTION_RULES_KEY);
+    return rules && typeof rules === 'object' ? rules : {};
+  } catch (e) {
+    console.warn('Failed to load exception rules:', e.message);
+    return {};
+  }
+}
+
+function getActiveExceptionRule(rules, emailLower) {
+  const rule = rules[emailLower];
+  if (!rule || rule.active === false) return null;
+
+  if (rule.expiresAt) {
+    const expiresAtMs = Date.parse(rule.expiresAt);
+    if (!Number.isNaN(expiresAtMs) && expiresAtMs <= Date.now()) {
+      return null;
+    }
+  }
+
+  return rule;
+}
+
+function buildSyntheticSubscriberResponse(cadenceWeeks = 4) {
+  return {
+    data: {
+      Subscriptions: [
+        {
+          status: 'ACTIVE',
+          BillingPolicy: {
+            interval: 'WEEK',
+            intervalCount: cadenceWeeks
+          }
+        }
+      ]
+    }
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CIRCUIT BREAKER
@@ -368,7 +416,7 @@ async function handleSkioQuery(req, res) {
   }
 
   // IMPORTANT: Normalize email to lowercase for consistent matching
-  const emailLower = email.toLowerCase().trim();
+  const emailLower = normalizeEmail(email);
   const emailHash = hashString(emailLower);
   const cacheKey = `skio:sub:${emailHash}`;
   const rateLimitKey = `skio:rl:${emailHash}`;
@@ -397,6 +445,22 @@ async function handleSkioQuery(req, res) {
   // Check rate limit
   if (rateLimitCount > CONFIG.RATE_LIMIT_MAX) {
     return res.status(429).json({ error: 'Rate limit exceeded', retryAfter: CONFIG.RATE_LIMIT_WINDOW });
+  }
+
+  // Manual exception rules override normal subscription lookup.
+  const exceptionRules = await getExceptionRules();
+  const exceptionRule = getActiveExceptionRule(exceptionRules, emailLower);
+  if (exceptionRule) {
+    const cadenceWeeks = Number.parseInt(exceptionRule.cadenceWeeks, 10);
+    const safeCadenceWeeks = Number.isFinite(cadenceWeeks) && cadenceWeeks > 0 ? cadenceWeeks : 4;
+    const action = (exceptionRule.action || 'ALLOW').toUpperCase();
+    const exceptionResponse = action === 'DENY'
+      ? { data: { Subscriptions: [] } }
+      : buildSyntheticSubscriberResponse(safeCadenceWeeks);
+
+    res.setHeader('X-Cache', 'BYPASS-EXCEPTION');
+    res.setHeader('X-Exception-Rule', action);
+    return res.status(200).json(exceptionResponse);
   }
 
   // ─────────────────────────────────────────────
@@ -517,7 +581,7 @@ async function handleClassReservation(req, res) {
     return res.status(400).json({ error: 'Email required' });
   }
 
-  const emailLower = email.toLowerCase().trim();
+  const emailLower = normalizeEmail(email);
   const emailHash = hashString(emailLower);
 
   // ─────────────────────────────────────────────
@@ -749,9 +813,17 @@ async function verifyQuarterlySubscription(email) {
     return false;
   }
 
-  const emailLower = email.toLowerCase().trim();
+  const emailLower = normalizeEmail(email);
   const emailHash = hashString(emailLower);
   const cacheKey = `skio:verify:${emailHash}`;
+
+  const exceptionRules = await getExceptionRules();
+  const exceptionRule = getActiveExceptionRule(exceptionRules, emailLower);
+  if (exceptionRule) {
+    const action = (exceptionRule.action || 'ALLOW').toUpperCase();
+    console.log(`📝 Manual exception matched for ${emailLower}: ${action}`);
+    return action !== 'DENY';
+  }
 
   // Check cache first (for reservations, we want fresh data but can use short cache)
   if (kv) {

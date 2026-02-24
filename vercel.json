@@ -2,9 +2,16 @@
   "functions": {
     "api/skio.js": {
       "maxDuration": 60
+    },
+    "api/exceptions.js": {
+      "maxDuration": 30
     }
   },
   "rewrites": [
+    {
+      "source": "/admin/exceptions",
+      "destination": "/exceptions-admin.html"
+    },
     {
       "source": "/api/skio/:path*",
       "destination": "/api/skio?path=:path*"

@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Skio Proxy - Exception Rules</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f8fb; color: #1b1f2a; }
+    .container { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 24px; margin: 0 0 16px; }
+    .card { background: #fff; border: 1px solid #e3e7ee; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .grid-1 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    input, select, textarea, button { width: 100%; box-sizing: border-box; font: inherit; }
+    input, select, textarea { padding: 10px; border: 1px solid #cfd6e4; border-radius: 8px; background: #fff; }
+    textarea { min-height: 78px; resize: vertical; }
+    button { border: none; border-radius: 8px; padding: 10px 12px; background: #0b57d0; color: #fff; font-weight: 600; cursor: pointer; }
+    button.secondary { background: #334155; }
+    button.danger { background: #b42318; }
+    .row { display: flex; gap: 10px; align-items: end; }
+    .row > * { flex: 1; }
+    .hint { font-size: 13px; color: #536074; margin: 0 0 12px; }
+    .status { margin-top: 10px; font-size: 13px; min-height: 18px; }
+    .status.error { color: #b42318; }
+    .status.ok { color: #0f7b0f; }
+    .lookup-box { background: #f8fafc; border: 1px solid #e6ebf3; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+    .lookup-note { font-size: 13px; min-height: 18px; margin-top: 8px; }
+    .lookup-note.ok { color: #0f7b0f; }
+    .lookup-note.error { color: #b42318; }
+    .quick-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 10px 0 12px; }
+    .quick-grid button { font-size: 13px; padding: 9px 8px; }
+    details { margin-top: 10px; }
+    summary { cursor: pointer; font-weight: 600; color: #334155; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; border-bottom: 1px solid #e6ebf3; padding: 10px 8px; vertical-align: top; }
+    th { font-size: 12px; text-transform: uppercase; color: #536074; letter-spacing: 0.02em; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .badge.allow { background: #e6f7eb; color: #0f7b0f; }
+    .badge.deny { background: #fde8e8; color: #b42318; }
+    @media (max-width: 740px) {
+      .grid, .quick-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>CS Exception Rules</h1>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label for="adminToken">Admin Token</label>
+          <input id="adminToken" type="password" placeholder="Paste EXCEPTIONS_ADMIN_TOKEN" />
+        </div>
+        <div style="max-width: 220px;">
+          <button id="saveToken" class="secondary" type="button">Save Token</button>
+        </div>
+      </div>
+      <div id="tokenStatus" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin:0 0 6px;font-size:18px;">Add / Update Rule</h2>
+      <p class="hint">Fast path: enter email, click a quick action, done.</p>
+      <form id="ruleForm">
+        <div class="grid">
+          <div>
+            <label for="email">Customer Email</label>
+            <input id="email" required type="email" placeholder="customer@example.com" />
+          </div>
+          <div>
+            <label for="action">Action</label>
+            <select id="action">
+              <option value="ALLOW">ALLOW (treat as subscriber)</option>
+              <option value="DENY">DENY (force block)</option>
+            </select>
+          </div>
+          <div>
+            <label for="cadenceWeeks">Cadence Weeks (for ALLOW)</label>
+            <input id="cadenceWeeks" type="number" min="1" step="1" value="4" />
+          </div>
+        </div>
+        <div class="quick-grid">
+          <button type="button" class="quick-action" data-action="ALLOW" data-cadence="4">Allow 4 Weeks</button>
+          <button type="button" class="quick-action" data-action="ALLOW" data-cadence="8">Allow 8 Weeks</button>
+          <button type="button" class="quick-action" data-action="ALLOW" data-cadence="12">Allow 12 Weeks</button>
+          <button type="button" class="danger quick-action" data-action="DENY" data-cadence="4">Deny Access</button>
+        </div>
+        <details>
+          <summary>Advanced Options (optional)</summary>
+          <div class="grid" style="margin-top:10px;">
+            <div>
+              <label for="addedBy">Added By</label>
+              <input id="addedBy" type="text" placeholder="CS rep name" />
+            </div>
+            <div>
+              <label for="expiresAt">Expires At</label>
+              <input id="expiresAt" type="datetime-local" />
+            </div>
+          </div>
+          <div class="grid-1" style="margin-top:10px;">
+            <div>
+              <label for="note">Note</label>
+              <textarea id="note" placeholder="Reason for exception"></textarea>
+            </div>
+          </div>
+        </details>
+        <div style="margin-top:12px;">
+          <button type="submit">Save Rule</button>
+        </div>
+      </form>
+      <div id="formStatus" class="status"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom: 12px;">
+        <h2 style="margin:0;font-size:18px;">Current Rules</h2>
+        <button id="refreshBtn" type="button" class="secondary" style="max-width: 180px;">Refresh</button>
+      </div>
+      <div class="lookup-box">
+        <label for="searchEmail">Quick Search By Email</label>
+        <div class="row">
+          <input id="searchEmail" type="email" placeholder="Type customer email to instantly check if rule exists" />
+          <button id="useFoundBtn" type="button" class="secondary" style="max-width: 180px;" disabled>Edit Found Rule</button>
+          <button id="clearSearchBtn" type="button" class="secondary" style="max-width: 160px;">Clear Search</button>
+        </div>
+        <div id="lookupStatus" class="lookup-note"></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Action</th>
+            <th>Cadence</th>
+            <th>Note</th>
+            <th>Added</th>
+            <th>Expires</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rulesBody">
+          <tr><td colspan="7">No rules yet.</td></tr>
+        </tbody>
+      </table>
+      <div id="tableStatus" class="status"></div>
+    </div>
+  </div>
+
+  <script>
+    const tokenInput = document.getElementById('adminToken');
+    const tokenStatus = document.getElementById('tokenStatus');
+    const formStatus = document.getElementById('formStatus');
+    const tableStatus = document.getElementById('tableStatus');
+    const rulesBody = document.getElementById('rulesBody');
+    const searchEmailInput = document.getElementById('searchEmail');
+    const lookupStatus = document.getElementById('lookupStatus');
+    const useFoundBtn = document.getElementById('useFoundBtn');
+    let allRules = [];
+    let exactMatchRule = null;
+
+    function getToken() {
+      return sessionStorage.getItem('exceptions_admin_token') || '';
+    }
+
+    function setStatus(el, message, isError) {
+      el.textContent = message || '';
+      el.className = 'status' + (message ? (isError ? ' error' : ' ok') : '');
+    }
+
+    function authHeaders() {
+      const token = getToken();
+      return {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      };
+    }
+
+    function normalizeEmail(value) {
+      return String(value || '').trim().toLowerCase();
+    }
+
+    function fmtDate(value) {
+      if (!value) return '-';
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? '-' : d.toLocaleString();
+    }
+
+    function esc(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    async function refreshRules() {
+      setStatus(tableStatus, 'Loading rules...', false);
+      try {
+        const res = await fetch('/api/exceptions', { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to load rules');
+        }
+        allRules = Array.isArray(data.rules) ? data.rules : [];
+        applySearchFilter();
+        setStatus(tableStatus, 'Rules loaded.', false);
+      } catch (err) {
+        setStatus(tableStatus, err.message, true);
+      }
+    }
+
+    function setLookup(message, isError) {
+      lookupStatus.textContent = message || '';
+      lookupStatus.className = 'lookup-note' + (message ? (isError ? ' error' : ' ok') : '');
+    }
+
+    function renderRules(rules, isFiltered) {
+      if (!rules.length) {
+        rulesBody.innerHTML = isFiltered
+          ? '<tr><td colspan="7">No matching rules for current search.</td></tr>'
+          : '<tr><td colspan="7">No rules yet.</td></tr>';
+        return;
+      }
+
+      rulesBody.innerHTML = rules.map((rule) => {
+        const actionClass = (rule.action || 'ALLOW').toUpperCase() === 'DENY' ? 'deny' : 'allow';
+        return `
+          <tr>
+            <td>${esc(rule.email)}</td>
+            <td><span class="badge ${actionClass}">${esc(rule.action || 'ALLOW')}</span></td>
+            <td>${esc(rule.cadenceWeeks || '-')}w</td>
+            <td>${esc(rule.note || '-')}</td>
+            <td>${fmtDate(rule.updatedAt || rule.createdAt)}</td>
+            <td>${fmtDate(rule.expiresAt)}</td>
+            <td><button type="button" class="danger" data-email="${esc(rule.email)}">Delete</button></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function applySearchFilter() {
+      const search = normalizeEmail(searchEmailInput.value);
+      const filtered = search
+        ? allRules.filter((rule) => String(rule.email || '').toLowerCase().includes(search))
+        : allRules;
+
+      renderRules(filtered, Boolean(search));
+
+      if (!search) {
+        exactMatchRule = null;
+        useFoundBtn.disabled = true;
+        setLookup('', false);
+        return;
+      }
+
+      const exact = allRules.find((rule) => String(rule.email || '').toLowerCase() === search);
+      if (exact) {
+        exactMatchRule = exact;
+        useFoundBtn.disabled = false;
+        setLookup(`Rule exists: ${exact.action || 'ALLOW'} (${exact.cadenceWeeks || '-'}w). Click "Edit Found Rule".`, false);
+      } else {
+        exactMatchRule = null;
+        useFoundBtn.disabled = true;
+        setLookup('No exact rule found for this email yet.', true);
+      }
+    }
+
+    function fillForm(rule) {
+      document.getElementById('email').value = normalizeEmail(rule.email);
+      document.getElementById('action').value = (rule.action || 'ALLOW').toUpperCase() === 'DENY' ? 'DENY' : 'ALLOW';
+      document.getElementById('cadenceWeeks').value = Number(rule.cadenceWeeks || 4);
+      document.getElementById('addedBy').value = rule.addedBy || '';
+      document.getElementById('note').value = rule.note || '';
+      document.getElementById('expiresAt').value = rule.expiresAt ? rule.expiresAt.slice(0, 16) : '';
+      setStatus(formStatus, 'Loaded existing rule into form.', false);
+    }
+
+    function getPayloadFromForm() {
+      return {
+        email: normalizeEmail(document.getElementById('email').value),
+        addedBy: document.getElementById('addedBy').value.trim(),
+        action: document.getElementById('action').value,
+        cadenceWeeks: Number(document.getElementById('cadenceWeeks').value || 4),
+        note: document.getElementById('note').value.trim(),
+        expiresAt: document.getElementById('expiresAt').value || null
+      };
+    }
+
+    async function saveRule(payload, successMessage) {
+      setStatus(formStatus, 'Saving rule...', false);
+      const res = await fetch('/api/exceptions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to save rule');
+      }
+      setStatus(formStatus, successMessage || 'Rule saved.', false);
+      searchEmailInput.value = payload.email || '';
+      await refreshRules();
+    }
+
+    document.getElementById('saveToken').addEventListener('click', async () => {
+      const token = tokenInput.value.trim();
+      if (!token) {
+        setStatus(tokenStatus, 'Enter a token first.', true);
+        return;
+      }
+      sessionStorage.setItem('exceptions_admin_token', token);
+      setStatus(tokenStatus, 'Token saved for this tab.', false);
+      await refreshRules();
+    });
+
+    document.getElementById('ruleForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await saveRule(getPayloadFromForm(), 'Rule saved.');
+      } catch (err) {
+        setStatus(formStatus, err.message, true);
+      }
+    });
+
+    document.querySelectorAll('.quick-action').forEach((button) => {
+      button.addEventListener('click', async () => {
+        try {
+          const email = normalizeEmail(document.getElementById('email').value || searchEmailInput.value);
+          if (!email || !email.includes('@')) {
+            setStatus(formStatus, 'Enter a valid customer email first.', true);
+            return;
+          }
+          const action = (button.dataset.action || 'ALLOW').toUpperCase();
+          const cadenceWeeks = Number(button.dataset.cadence || 4);
+          document.getElementById('email').value = email;
+          document.getElementById('action').value = action;
+          document.getElementById('cadenceWeeks').value = cadenceWeeks;
+          await saveRule({
+            ...getPayloadFromForm(),
+            email,
+            action,
+            cadenceWeeks
+          }, `Quick rule applied: ${action} (${cadenceWeeks}w).`);
+        } catch (err) {
+          setStatus(formStatus, err.message, true);
+        }
+      });
+    });
+
+    rulesBody.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-email]');
+      if (!btn) return;
+      const email = btn.getAttribute('data-email');
+      if (!email) return;
+      if (!window.confirm('Delete rule for ' + email + '?')) return;
+
+      setStatus(tableStatus, 'Deleting rule...', false);
+      try {
+        const res = await fetch('/api/exceptions', {
+          method: 'DELETE',
+          headers: authHeaders(),
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to delete rule');
+        }
+        setStatus(tableStatus, 'Rule deleted.', false);
+        await refreshRules();
+      } catch (err) {
+        setStatus(tableStatus, err.message, true);
+      }
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', refreshRules);
+    searchEmailInput.addEventListener('input', applySearchFilter);
+    useFoundBtn.addEventListener('click', () => {
+      if (!exactMatchRule) return;
+      fillForm(exactMatchRule);
+      document.getElementById('email').focus();
+    });
+    document.getElementById('clearSearchBtn').addEventListener('click', () => {
+      searchEmailInput.value = '';
+      applySearchFilter();
+      searchEmailInput.focus();
+    });
+
+    tokenInput.value = getToken();
+    if (getToken()) {
+      setStatus(tokenStatus, 'Token loaded from this tab session.', false);
+      refreshRules();
+    }
+  </script>
+</body>
+</html>

@@ -7,6 +7,7 @@ A Vercel serverless proxy for the Skio API that keeps your API key secure on the
 - ✅ API key stored securely in Vercel environment variables
 - ✅ CORS restricted to your Shopify domain
 - ✅ Frontend makes requests to proxy, not directly to Skio
+- ✅ Manual exception rules UI for CS team (`/admin/exceptions`)
 
 ## Setup
 
@@ -22,6 +23,9 @@ vercel
 # Add environment variable
 vercel env add SKIO_API_KEY
 # Enter your API key when prompted
+
+# Add CS admin token for exception management
+vercel env add EXCEPTIONS_ADMIN_TOKEN
 
 # Redeploy with env var
 vercel --prod
@@ -59,3 +63,19 @@ Update the `allowedOrigins` array in `api/skio/[...path].js` to include your dom
 ```javascript
 const allowedOrigins = ['https://im8store.myshopify.com', 'https://your-domain.com'];
 ```
+
+## CS Exception Rules Admin
+
+After deploy, open:
+
+`https://your-vercel-app.vercel.app/admin/exceptions`
+
+What it does:
+- Add manual `ALLOW` or `DENY` rules by customer email
+- Optional expiration timestamp and note
+- `ALLOW` rules can specify `cadenceWeeks` (defaults to 4)
+- Rules are stored in Vercel KV under `skio:exceptions:rules`
+
+Rule behavior:
+- `/api/skio` checks these rules first; `ALLOW` returns a synthetic active subscription, `DENY` returns no subscriptions
+- `reserve-class` server-side verification also checks rules first
