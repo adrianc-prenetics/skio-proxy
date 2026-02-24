@@ -824,25 +824,27 @@ async function verifyQuarterlySubscription(email) {
       if (status !== 'ACTIVE') return false;
       
       const policy = sub.BillingPolicy || {};
-      const interval = (policy.interval || '').toUpperCase();
-      const count = parseInt(policy.intervalCount) || 0;
+      const cadenceDays = getBillingCadenceDays(policy);
       
-      // Quarterly = 12 weeks OR 3 months OR ~90 days
-      const isQuarterly = (
-        (interval === 'WEEK' && count === 12) ||
-        (interval === 'MONTH' && count === 3) ||
-        (interval === 'DAY' && count >= 84 && count <= 90)
+      // Access cadence should follow actual Skio billing frequency.
+      // Current program supports 4/8/12-week cadences.
+      // Keep ~quarterly day-based fallback for month-based policies.
+      const isEligibleCadence = cadenceDays !== null && (
+        cadenceDays === 28 || // 4 weeks
+        cadenceDays === 56 || // 8 weeks
+        cadenceDays === 84 || // 12 weeks
+        (cadenceDays >= 84 && cadenceDays <= 95) // ~quarterly fallback
       );
       
-      if (isQuarterly) {
-        console.log('✅ Found quarterly:', interval, count);
+      if (isEligibleCadence) {
+        console.log('✅ Found eligible billing cadence:', cadenceDays, 'days');
       }
       
-      return isQuarterly;
+      return isEligibleCadence;
     });
 
     if (!hasQuarterly && subscriptions.length > 0) {
-      console.log('⚠️ User has subscriptions but none are quarterly');
+      console.log('⚠️ User has subscriptions but none match eligible billing cadence');
     }
 
     // Cache the result
@@ -884,4 +886,16 @@ function hashString(str) {
     hash = hash & hash;
   }
   return Math.abs(hash).toString(36);
+}
+
+function getBillingCadenceDays(policy = {}) {
+  const interval = (policy.interval || '').toUpperCase();
+  const count = parseInt(policy.intervalCount, 10) || 0;
+  if (!count) return null;
+
+  // Normalize BillingPolicy to an approximate day cadence for consistent checks.
+  if (interval === 'DAY' || interval === 'DAYS') return count;
+  if (interval === 'WEEK' || interval === 'WEEKS') return count * 7;
+  if (interval === 'MONTH' || interval === 'MONTHS') return count * 30;
+  return null;
 }
