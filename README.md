@@ -75,6 +75,7 @@ What it does:
 - Optional expiration timestamp and note
 - `ALLOW` rules can specify `cadenceWeeks` (defaults to 4)
 - Rules are stored in Vercel KV under `skio:exceptions:rules`
+- If KV REST vars are not set, the proxy falls back to `EXCEPTIONS_KV_REDIS_URL` or `REDIS_URL`
 
 Rule behavior:
 - `/api/skio` checks these rules first; `ALLOW` returns a synthetic active subscription, `DENY` returns no subscriptions

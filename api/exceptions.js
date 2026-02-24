@@ -3,6 +3,33 @@ try {
   if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
     const kvModule = await import('@vercel/kv');
     kv = kvModule.kv;
+  } else if (process.env.EXCEPTIONS_KV_REDIS_URL || process.env.REDIS_URL) {
+    const redisUrl = process.env.EXCEPTIONS_KV_REDIS_URL || process.env.REDIS_URL;
+    const redisModule = await import('ioredis');
+    const Redis = redisModule.default;
+    const redis = new Redis(redisUrl, {
+      maxRetriesPerRequest: 1,
+      enableReadyCheck: false
+    });
+
+    kv = {
+      async get(key) {
+        const value = await redis.get(key);
+        if (value === null || value === undefined) return null;
+        try {
+          return JSON.parse(value);
+        } catch {
+          return value;
+        }
+      },
+      async set(key, value, options = {}) {
+        const payload = typeof value === 'string' ? value : JSON.stringify(value);
+        if (options?.ex) {
+          return redis.set(key, payload, 'EX', options.ex);
+        }
+        return redis.set(key, payload);
+      }
+    };
   }
 } catch (e) {
   console.warn('KV not available for exceptions API:', e.message);
